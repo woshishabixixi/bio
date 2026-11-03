@@ -533,7 +533,9 @@ function renderFav() {
     + '<div class="fav-line">' + esc(f.text) + '</div></div>').join('');
   view.innerHTML = '<div class="lib-tabs">' + tab('lines', '要点收藏', state.fav.lines.length) + tab('correct', '答对列表', state.fav.correct.length) + '</div>'
     + '<div class="quiz-entry"><button class="btn primary" data-action="start-quiz" type="button">开始填空练习</button>'
-    + '<span class="dim">从收藏的要点里出题：给一句要点，选出它属于哪张卡</span></div>'
+    + '<span class="dim">从收藏的要点里出题：给一句要点，选出它属于哪张卡</span>'
+    + '<div class="drill-entry"><button class="btn" data-action="start-drill" data-m="order" type="button">排序练习</button>'
+    + '<button class="btn" data-action="start-drill" data-m="tf" type="button">判断对错</button></div></div>'
     + (state.favTab === 'lines'
       ? (lines || '<div class="empty"><strong>还没有收藏</strong>卡片里每条要点左边有 ☆，点一下就能收藏。</div>')
       : (correct || '<div class="empty"><strong>还没有答对记录</strong>去填空练习答对，就会进到这里。</div>'));
@@ -691,7 +693,10 @@ function renderDrill() {
 function renderOrderBody() {
   const o = state.drill.order;
   if (!o || o.error) {
-    return '<div class="empty"><strong>能出排序题的卡还不够</strong>需要至少一张有三个以上步骤的卡。</div>';
+    return '<div class="empty"><strong>排序题暂时出不了</strong>'
+      + '排序题只从「有明确先后步骤」的卡出题（如实验流程、生理过程），现在题库里还没有这类卡。<br>'
+      + '<span class="dim">请用「合并导入」导入最新的 bio-deck 文件（含流程数据）。</span><br>'
+      + '<button class="btn primary" data-action="drill-mode" data-m="tf" type="button" style="margin-top:10px">先做判断对错</button></div>';
   }
   const list = o.items.map((t) => {
     const at = o.picked.indexOf(t);
@@ -729,6 +734,13 @@ function renderTFBody() {
     + '<div class="quiz-actions"><button class="btn primary" data-action="drill-next" type="button">下一题</button></div>';
 }
 
+function drillEntryHtml() {
+  return '<div class="drill-entry">'
+    + '<button class="btn" data-action="start-drill" data-m="order" type="button">排序练习</button>'
+    + '<button class="btn" data-action="start-drill" data-m="tf" type="button">判断对错</button>'
+    + '<button class="btn" data-action="start-quiz" type="button">填空练习</button></div>';
+}
+
 function renderTagBar() {
   const active = Array.from(state.cards.values()).filter((c) => c.bucket !== 'mastered');
   const counts = new Map();
@@ -754,9 +766,13 @@ function renderReview() {
       + (cur
         ? '<div class="empty"><strong>「' + esc(cur) + '」这一类今天没有要背的卡了</strong>'
           + '换一类继续，或者回「全部」看看。<br>'
-          + '<button class="btn primary" data-action="set-tag" data-tag="" type="button" style="margin-top:10px">看全部</button></div>'
+          + '<button class="btn primary" data-action="set-tag" data-tag="" type="button" style="margin-top:10px">看全部</button>'
+          + '<div class="dim" style="margin-top:14px">今天背完了，可以做练习巩固：</div>'
+          + drillEntryHtml() + '</div>'
         : '<div class="empty"><strong>今天没有要背的卡了</strong>'
-          + '去「题库 → 合并导入」把题库导进来。<br><span class="dim">导入后这里会按分类显示今天要背的卡片。</span></div>');
+          + '去「题库 → 合并导入」把题库导进来。<br><span class="dim">导入后这里会按分类显示今天要背的卡片。</span>'
+          + '<div class="dim" style="margin-top:14px">也可以先做练习：</div>'
+          + drillEntryHtml() + '</div>');
     return;
   }
   const revealed = state.revealed;
@@ -772,9 +788,7 @@ function renderReview() {
   const pct = totalToday ? Math.round((doneToday / totalToday) * 100) : 0;
   view.innerHTML = renderTagBar()
     + '<div class="today-bar"><div class="today-fill" style="width:' + pct + '%"></div></div>'
-    + '<div class="drill-entry"><button class="btn" data-action="start-drill" data-m="order" type="button">排序练习</button>'
-    + '<button class="btn" data-action="start-drill" data-m="tf" type="button">判断对错</button>'
-    + '<button class="btn" data-action="start-quiz" type="button">填空练习</button></div>'
+    + drillEntryHtml()
     + '<div class="today-text">今日进度 ' + doneToday + ' / ' + totalToday
     + (state.lastUndo ? '　<span class="undo-tip">按 U 撤销上一步</span>' : '') + '</div>'
     // 翻开解法后，题面变成悬浮窗（宽屏浮在左侧、窄屏吸顶），方便边看解析边瞟题
@@ -897,6 +911,7 @@ function renderLibrary() {
     + '</div>').join('');
   const tab = (k, label, n2) => '<button class="lib-tab' + (f === k ? ' on' : '') + '" data-action="lib-filter" data-f="' + k + '" type="button">' + label + ' ' + n2 + '</button>';
   view.innerHTML = (state.editor !== null && state.editor !== undefined ? renderEditor() : '')
+    + drillEntryHtml()
     + '<div class="list-head"><input class="search" id="search" value="' + esc(state.search) + '" placeholder="搜术语或详解">'
     + '<button class="btn primary" data-action="new-card" type="button">+ 拍题</button></div>'
     + '<div class="lib-tabs">' + tab('all', '全部', all.length) + tab('active', '在练', nActive)
@@ -1005,7 +1020,7 @@ function renderSettings() {
     + '<p class="sub">合并导入只加新题、同 id 的跳过——以后分批加题用它，不会冲掉你手机上已有的题。</p>'
     + '<p class="sub" id="audio-line">语音包：检测中…</p>'
     + '<p class="sub" id="stats-line">统计中…</p>'
-    + '<p class="sub dim">代码版本 v6-drill（如果你看不到这一行，说明页面还是旧代码，按 Ctrl+Shift+R 强制刷新）</p>'
+    + '<p class="sub dim">代码版本 v7-drill-all（如果你看不到这一行，说明页面还是旧代码，按 Ctrl+Shift+R 强制刷新）</p>'
     + '<div class="actions"><button class="btn danger" data-action="reset" type="button">重置全部数据</button></div></div>';
 }
 
