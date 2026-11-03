@@ -34,6 +34,8 @@ const state = {
   quiz: null,
   anim: 0,
   drill: { mode: 'order', order: null, tf: null, score: { ok: 0, total: 0 } },
+  run: { cur: 0, best: 0, total: 0, m3: 0, m5: 0, m10: 0 },
+  sound: 'on',
 };
 
 const view = document.getElementById('view');
@@ -113,6 +115,8 @@ async function loadAll() {
   state.settings = { ...DEFAULT_SETTINGS, ...(settings || {}) };
   state.streak = (await db.getMeta('streak', null)) || { lastDate: '', count: 0 };
   state.newDone = (await db.getMeta('newDone', null)) || { date: '', count: 0 };
+  state.run = (await db.getMeta('run', null)) || { cur: 0, best: 0, total: 0, m3: 0, m5: 0, m10: 0 };
+  state.sound = (await db.getMeta('sound', null)) || 'on';
   state.fav = (await db.getMeta('fav', null)) || { lines: [], correct: [] };
   if (!Array.isArray(state.fav.lines)) state.fav.lines = [];
   if (!Array.isArray(state.fav.correct)) state.fav.correct = [];
@@ -557,12 +561,13 @@ function renderQuiz() {
     return '<button class="' + cls + '" data-action="pick" data-o="' + i + '" type="button"'
       + (q.done ? ' disabled' : '') + '>' + String.fromCharCode(65 + i) + '　' + esc(o) + '</button>';
   }).join('');
-  view.innerHTML = '<div class="quiz-head">这句要点说的是哪一项？</div>'
+  view.innerHTML = streakBadgeHtml() + '<div class="quiz-head">这句要点说的是哪一项？</div>'
     + '<div class="quiz-sentence">' + esc(q.item.text) + '</div>'
     + '<div class="quiz-opts">' + opts + '</div>'
     + (q.done
       ? '<div class="quiz-result">' + (q.picked === q.right ? '✅ 答对了 · 已加入答对列表' : '❌ 正确答案：' + esc(q.right))
         + '</div><div class="quiz-actions"><button class="btn primary" data-action="next-quiz" type="button">下一题</button>'
+        + jumpBtn(q.item.cardId)
         + '<button class="btn" data-action="go-review" type="button">回去背卡</button></div>'
       : '')
     + (q.done ? '<div class="quiz-answer">核心答案：' + esc((q.item.answer || '').slice(0, 120)) + '</div>' : '');
@@ -580,6 +585,7 @@ async function pickOption(i) {
     }
     state.fav.lines = state.fav.lines.filter((f) => f.key !== key);
     await db.setMeta('fav', state.fav);
+    runAnswer(true);
     celebrate();
   }
   renderQuiz();
@@ -707,14 +713,15 @@ function renderOrderBody() {
   const right = o.done
     ? '<div class="order-right"><h3>正确顺序</h3>' + o.right.map((t, i) => '<div class="order-line"><b>' + (i + 1) + '</b><span>' + esc(t) + '</span></div>').join('') + '</div>'
     : '';
-  return '<div class="quiz-head">按正确顺序点击步骤 · ' + esc(o.term) + '</div>'
+  return streakBadgeHtml() + '<div class="quiz-head">按正确顺序点击步骤 · ' + esc(o.term) + '</div>'
     + '<div class="order-list">' + list + '</div>'
     + (o.done
       ? '<div class="quiz-result">' + (o.ok ? '✅ 顺序全对' : '❌ 顺序不对，看下面的正确顺序') + '</div>' + right
       : '<div class="quiz-actions"><button class="btn primary" data-action="order-check" type="button"'
         + (o.picked.length === o.items.length ? '' : ' disabled') + '>检查顺序</button>'
         + '<button class="btn" data-action="order-reset" type="button">重新点</button></div>')
-    + '<div class="quiz-actions"><button class="btn" data-action="drill-next" type="button">下一题</button></div>';
+    + '<div class="quiz-actions"><button class="btn" data-action="drill-next" type="button">下一题</button>'
+    + (o.done ? jumpBtn(o.cardId) : '') + '</div>';
 }
 
 function renderTFBody() {
@@ -725,13 +732,14 @@ function renderTFBody() {
       + '<div class="tf-truth">这句说的是<b>' + esc(t.term) + '</b>。正确表述：' + esc(t.truth) + '</div>'
       + (t.isTrue ? '' : '<div class="tf-truth dim">错在：' + esc(t.note) + '</div>') + '</div>'
     : '';
-  return '<div class="quiz-head">这句话对不对？</div>'
+  return streakBadgeHtml() + '<div class="quiz-head">这句话对不对？</div>'
     + '<div class="quiz-sentence">' + esc(t.statement) + '</div>'
     + '<div class="tf-actions">'
     + '<button class="qopt tf-btn' + (t.done && t.picked === true ? (t.isTrue ? ' right' : ' wrong') : '') + '" data-action="tf-pick" data-v="1" type="button"' + (t.done ? ' disabled' : '') + '>✔ 对</button>'
     + '<button class="qopt tf-btn' + (t.done && t.picked === false ? (t.isTrue ? ' wrong' : ' right') : '') + '" data-action="tf-pick" data-v="0" type="button"' + (t.done ? ' disabled' : '') + '>✘ 错</button>'
     + '</div>' + back
-    + '<div class="quiz-actions"><button class="btn primary" data-action="drill-next" type="button">下一题</button></div>';
+    + '<div class="quiz-actions"><button class="btn primary" data-action="drill-next" type="button">下一题</button>'
+    + (t.done ? jumpBtn(t.cardId) : '') + '</div>';
 }
 
 function drillEntryHtml() {
@@ -980,7 +988,13 @@ function statsSection() {
   const maxN = Math.max(1, ...days.map((d) => d.n));
   const bars = days.map((d) => '<div class="fc"><i style="height:' + Math.round((d.n / maxN) * 100) + '%"></i>'
     + '<span>' + d.n + '</span><em>' + d.label + '</em></div>').join('');
-  return '<div class="section"><h2>统计</h2>'
+  const soundOn = state.sound !== 'off';
+  return '<div class="section"><h2>连对成就</h2>'
+    + '<div class="ach-row"><span>历史最高</span><b>×' + state.run.best + '</b></div>'
+    + '<div class="ach-row"><span>三连 / 五连 / 十连</span><b>' + state.run.m3 + ' / ' + state.run.m5 + ' / ' + state.run.m10 + '</b></div>'
+    + '<div class="ach-row"><span>累计答对</span><b>' + state.run.total + '</b></div>'
+    + '<div class="actions"><button class="btn" data-action="toggle-sound" type="button">音效：' + (soundOn ? '开（随机古琴/风铃/木鱼）' : '关') + '</button></div></div>'
+    + '<div class="section"><h2>统计</h2>'
     + '<p class="sub">今天已评 ' + doneToday.length + ' 张</p>' + (rows || '<p class="sub dim">今天还没开始</p>')
     + '<h3>未来 7 天到期</h3><div class="forecast">' + bars + '</div></div>';
 }
@@ -1020,7 +1034,7 @@ function renderSettings() {
     + '<p class="sub">合并导入只加新题、同 id 的跳过——以后分批加题用它，不会冲掉你手机上已有的题。</p>'
     + '<p class="sub" id="audio-line">语音包：检测中…</p>'
     + '<p class="sub" id="stats-line">统计中…</p>'
-    + '<p class="sub dim">代码版本 v7-drill-all（如果你看不到这一行，说明页面还是旧代码，按 Ctrl+Shift+R 强制刷新）</p>'
+    + '<p class="sub dim">代码版本 v8-jump-streak（如果你看不到这一行，说明页面还是旧代码，按 Ctrl+Shift+R 强制刷新）</p>'
     + '<div class="actions"><button class="btn danger" data-action="reset" type="button">重置全部数据</button></div></div>';
 }
 
@@ -1297,6 +1311,14 @@ if (view) {
     if (action === 'start-drill') { startDrill(el.dataset.m || 'order'); return; }
     if (action === 'drill-mode') { startDrill(el.dataset.m || 'order'); return; }
     if (action === 'drill-next') { startDrill(state.drill.mode); return; }
+    if (action === 'goto-card') { state.quiz = null; state.drill.order = null; state.drill.tf = null; gotoCard(el.dataset.id); return; }
+    if (action === 'toggle-sound') {
+      state.sound = state.sound === 'off' ? 'on' : 'off';
+      await db.setMeta('sound', state.sound);
+      if (state.sound === 'on') playSound('answer');
+      render();
+      return;
+    }
     if (action === 'order-pick') {
       const o = state.drill.order;
       if (!o || o.done) return;
@@ -1313,6 +1335,7 @@ if (view) {
       o.ok = o.picked.every((t, i) => t === o.right[i]);
       o.done = true;
       state.drill.score.total++;
+      runAnswer(o.ok);
       if (o.ok) { state.drill.score.ok++; celebrate(); }
       render();
       return;
@@ -1324,6 +1347,7 @@ if (view) {
       t.ok = t.picked === t.isTrue;
       t.done = true;
       state.drill.score.total++;
+      runAnswer(t.ok);
       if (t.ok) { state.drill.score.ok++; celebrate(); }
       render();
       return;
@@ -1477,6 +1501,115 @@ const CELEBRATIONS = [
   { emoji: '🍃', text: '轻舟已过', cls: 'drift', color: '#16a34a' },
   { emoji: '💯', text: '漂亮，继续', cls: 'burst', color: '#f97316' },
 ];
+
+function playSound(kind) {
+  if (state.sound === 'off') return;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = playSound.ctx || (playSound.ctx = new AC());
+    if (ctx.state === 'suspended') ctx.resume();
+    const now = ctx.currentTime;
+    const timbres = ['qin', 'bell', 'wood'];
+    const pick = kind === 'milestone' ? 'qin' : timbres[Math.floor(Math.random() * timbres.length)];
+    const base = 196 + Math.floor(Math.random() * 6) * 28;
+    const out = ctx.createGain();
+    out.gain.value = 0.16;
+    out.connect(ctx.destination);
+    if (pick === 'qin') {
+      const len = Math.floor(ctx.sampleRate * 1.6);
+      const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      const period = Math.max(2, Math.round(ctx.sampleRate / base));
+      for (let i = 0; i < period; i++) data[i] = Math.random() * 2 - 1;
+      for (let i = period; i < len; i++) data[i] = 0.996 * 0.5 * (data[i - period] + data[i - period + 1]);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass'; lp.frequency.value = 2600;
+      src.connect(lp); lp.connect(out);
+      src.start(now);
+    } else if (pick === 'bell') {
+      [1, 2.01].forEach(function (mul, i) {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = 'sine';
+        o.frequency.value = base * 2 * mul;
+        g.gain.setValueAtTime(0.0001, now);
+        g.gain.exponentialRampToValueAtTime(i ? 0.06 : 0.12, now + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + (i ? 0.6 : 1.1));
+        o.connect(g); g.connect(out);
+        o.start(now); o.stop(now + 1.2);
+      });
+    } else {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      const bp = ctx.createBiquadFilter();
+      o.type = 'triangle'; o.frequency.value = base * 1.5;
+      bp.type = 'bandpass'; bp.frequency.value = base * 1.5; bp.Q.value = 6;
+      g.gain.setValueAtTime(0.2, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+      o.connect(bp); bp.connect(g); g.connect(out);
+      o.start(now); o.stop(now + 0.14);
+    }
+  } catch (e) { /* 静默失败 */ }
+}
+
+function streakLevel() {
+  const n = state.run.cur;
+  if (n >= 10) return 4;
+  if (n >= 5) return 3;
+  if (n >= 3) return 2;
+  if (n >= 2) return 1;
+  return 0;
+}
+
+function streakBadgeHtml() {
+  const n = state.run.cur;
+  const goal = n >= 10 ? '登峰' : n >= 5 ? '再 ' + (10 - n) + ' 题到十连' : n >= 3 ? '再 ' + (5 - n) + ' 题到五连' : '再 ' + (3 - n) + ' 题到三连';
+  return '<div class="streak-row"><span class="streak-badge lv' + streakLevel() + '">连对 ×' + n + '</span>'
+    + '<span class="streak-goal">' + goal + '</span>'
+    + '<div class="streak-bar"><i class="lv' + streakLevel() + '" style="width:' + Math.min(100, (n / 10) * 100) + '%"></i></div></div>';
+}
+
+function milestoneBanner(n) {
+  const bar = document.createElement('div');
+  bar.className = 'milestone-bar';
+  bar.textContent = n === 3 ? '🏅 三连达成 · 已记入成就' : n === 5 ? '🏆 五连达成 · 越来越稳' : '👑 十连登峰 · 已记入成就';
+  document.body.appendChild(bar);
+  setTimeout(function () { bar.remove(); }, 2400);
+}
+
+function runAnswer(ok) {
+  if (ok) {
+    state.run.cur += 1;
+    state.run.total += 1;
+    if (state.run.cur > state.run.best) state.run.best = state.run.cur;
+    if (state.run.cur === 3) state.run.m3 += 1;
+    if (state.run.cur === 5) state.run.m5 += 1;
+    if (state.run.cur === 10) state.run.m10 += 1;
+    if ([3, 5, 10].indexOf(state.run.cur) >= 0) { milestoneBanner(state.run.cur); playSound('milestone'); }
+    else playSound('answer');
+  } else {
+    state.run.cur = 0;
+    playSound('answer');
+  }
+  db.setMeta('run', state.run);
+}
+
+function gotoCard(id) {
+  const c = state.cards.get(id);
+  if (!c) { toast('这张卡不在题库里'); return; }
+  state.queue = [id].concat(state.queue.filter(function (x) { return x !== id; }));
+  state.route = 'review';
+  state.revealed = true;
+  render();
+  toast('已跳到这张卡的知识点');
+}
+
+function jumpBtn(cardId) {
+  return '<button class="btn jump" data-action="goto-card" data-id="' + esc(cardId) + '" type="button">📖 看这张卡的知识点</button>';
+}
 
 function celebrate() {
   const c = CELEBRATIONS[Math.floor(Math.random() * CELEBRATIONS.length)];
