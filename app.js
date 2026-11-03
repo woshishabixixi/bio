@@ -26,6 +26,14 @@ const state = {
   search: '',
   libFilter: 'all',
   importMode: 'replace',
+  lastUndo: null,
+  buried: [],
+  buriedDate: '',
+  fav: { lines: [], correct: [] },
+  favTab: 'lines',
+  quiz: null,
+  anim: 0,
+  drill: { mode: 'order', order: null, tf: null, score: { ok: 0, total: 0 } },
 };
 
 const view = document.getElementById('view');
@@ -105,6 +113,11 @@ async function loadAll() {
   state.settings = { ...DEFAULT_SETTINGS, ...(settings || {}) };
   state.streak = (await db.getMeta('streak', null)) || { lastDate: '', count: 0 };
   state.newDone = (await db.getMeta('newDone', null)) || { date: '', count: 0 };
+  state.fav = (await db.getMeta('fav', null)) || { lines: [], correct: [] };
+  if (!Array.isArray(state.fav.lines)) state.fav.lines = [];
+  if (!Array.isArray(state.fav.correct)) state.fav.correct = [];
+  const buriedMeta = await db.getMeta('buried', null);
+  if (buriedMeta && buriedMeta.date === dayKey()) { state.buried = buriedMeta.ids || []; state.buriedDate = buriedMeta.date; }
 }
 
 function newDoneToday() { return state.newDone.date === dayKey() ? state.newDone.count : 0; }
@@ -133,8 +146,10 @@ function interleave(ids) {
 
 function rebuildQueue() {
   const tagFilter = state.settings.tagFilter || '';
+  const buriedToday = state.buriedDate === dayKey() ? state.buried : [];
   const list = Array.from(state.cards.values())
-    .filter((c) => !tagFilter || (c.tags || [])[0] === tagFilter);
+    .filter((c) => !tagFilter || (c.tags || [])[0] === tagFilter)
+    .filter((c) => !buriedToday.includes(c.id));
   let q = buildQueue(list, {
     now: Date.now(),
     dailyNewLimit: state.settings.dailyNewLimit,
@@ -281,6 +296,14 @@ async function gradeCard(g) {
   if (!card) return;
   if (!state.revealed) { toast('先看详解，再评分'); return; }
   const wasNew = card.state === 'new';
+  // 撤销快照：评分前把卡片与计数状态整份存下来，按 U 可以整份还原
+  state.lastUndo = {
+    card: JSON.parse(JSON.stringify(card)),
+    wasNew,
+    newDone: { ...state.newDone },
+    relearn: JSON.parse(JSON.stringify(state.relearn)),
+    grade: g,
+  };
   const patched = { ...card, ...schedule(card, g, Date.now()) };
   await persist(patched);
   db.logReview({ id: card.id, grade: g });
@@ -297,6 +320,34 @@ async function gradeCard(g) {
   rebuildQueue();
   resetCardState();
   render();
+}
+
+async function undoLast() {
+  const u = state.lastUndo;
+  if (!u) { toast('没有可撤销的操作'); return; }
+  await persist(u.card);
+  state.newDone = { ...u.newDone };
+  await db.setMeta('newDone', state.newDone);
+  state.relearn = u.relearn;
+  state.lastUndo = null;
+  rebuildQueue();
+  state.queue = [u.card.id].concat(state.queue.filter((x) => x !== u.card.id));
+  state.revealed = true;
+  render();
+  toast('已撤销上一次评分');
+}
+
+async function buryCurrent() {
+  const card = currentCard();
+  if (!card) return;
+  const today = dayKey();
+  if (state.buriedDate !== today) { state.buried = []; state.buriedDate = today; }
+  if (!state.buried.includes(card.id)) state.buried.push(card.id);
+  await db.setMeta('buried', { date: state.buriedDate, ids: state.buried });
+  rebuildQueue();
+  resetCardState();
+  render();
+  toast('这张今天不再出现');
 }
 
 async function masterCard(id) {
@@ -385,6 +436,299 @@ function cardTipAnswers(card) {
 }
 
 /** 顶部「知识点分类」筛选条：全部 / 各知识点（带数量） */
+function basicsLines(card) {
+  return String(card.basics || '')
+    .split(/\n+/)
+    .map((s) => s.replace(/^\s*[①-⑳]\s*/, '').trim())
+    .filter(Boolean);
+}
+
+function favKey(cardId, text) { return cardId + '|' + text; }
+
+function stepLines(card) {
+  return cardSteps(card).map((s) => String(s.detail || '').replace(/^\s*[①-⑳]\s*/, '').trim()).filter(Boolean);
+}
+
+function favText(card, kind, idx) {
+  const lines = kind === 'step' ? stepLines(card) : basicsLines(card);
+  return lines[Number(idx)] || '';
+}
+
+function starBtn(cardId, kind, idx, text) {
+  const on = state.fav.lines.some((f) => f.key === favKey(cardId, text));
+  return '<button class="star' + (on ? ' on' : '') + '" data-action="fav-line" data-id="' + esc(cardId)
+    + '" data-kind="' + kind + '" data-i="' + esc(idx) + '" type="button" title="收藏这条">'
+    + (on ? '★' : '☆') + '</button>';
+}
+
+function renderBasics(card) {
+  const lines = basicsLines(card);
+  if (!lines.length) return esc(formatStem(card.basics));
+  return lines.map((t, i) => '<div class="bline">'
+    + starBtn(card.id, 'basic', i, t)
+    + '<span>' + esc(formatStem(t)) + '</span></div>').join('');
+}
+
+async function toggleFavLine(cardId, idx, kind) {
+  const card = state.cards.get(cardId);
+  if (!card) return;
+  const kindName = kind === 'step' ? 'step' : 'basic';
+  const text = favText(card, kindName, idx);
+  if (!text) return;
+  const key = favKey(cardId, text);
+  const at = state.fav.lines.findIndex((f) => f.key === key);
+  if (at >= 0) {
+    state.fav.lines.splice(at, 1);
+    toast('已取消收藏');
+  } else {
+    state.fav.lines.unshift({ key, cardId, text, kind: kindName, answer: card.answer || '', stem: card.stem || '' });
+    toast('已收藏 · 可去「收藏 → 填空」练');
+  }
+  await db.setMeta('fav', state.fav);
+  render();
+}
+
+function quizPool() {
+  // 题库只从收藏的要点里出；干扰项优先取同一分类的其它卡
+  return state.fav.lines.map((f) => {
+    const card = state.cards.get(f.cardId);
+    return { ...f, tag: (card && (card.tags || [])[0]) || '' };
+  });
+}
+
+function buildQuiz() {
+  const pool = quizPool();
+  if (pool.length < 2) { state.quiz = { error: 'short' }; return; }
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  const own = pick.stem || (state.cards.get(pick.cardId) || {}).stem || '';
+  const short = (s) => String(s || '').replace(/\s+/g, '').replace(/[？?。].*$/, '').slice(0, 18);
+  const right = short(own);
+  const same = Array.from(state.cards.values())
+    .filter((c) => c.id !== pick.cardId && short(c.stem) && short(c.stem) !== right)
+    .filter((c) => ((c.tags || [])[0] || '') === pick.tag);
+  const other = Array.from(state.cards.values())
+    .filter((c) => c.id !== pick.cardId && short(c.stem) && short(c.stem) !== right);
+  const pool2 = same.length >= 3 ? same : other;
+  const distract = [];
+  const used = new Set([right]);
+  const shuffled = pool2.sort(() => Math.random() - 0.5);
+  for (const c of shuffled) {
+    const s = short(c.stem);
+    if (used.has(s)) continue;
+    used.add(s); distract.push(s);
+    if (distract.length === 3) break;
+  }
+  const options = [right, ...distract].sort(() => Math.random() - 0.5);
+  state.quiz = { item: pick, options, right, picked: null, done: false };
+}
+
+function renderFav() {
+  const tab = (k, label, n) => '<button class="lib-tab' + (state.favTab === k ? ' on' : '') + '" data-action="fav-tab" data-f="' + k + '" type="button">' + label + ' ' + n + '</button>';
+  const kindTag = (k) => '<span class="tag">' + (k === 'step' ? '详解' : '要点') + '</span>';
+  const lines = state.fav.lines.map((f) => '<div class="fav-card"><div class="fav-head"><b>' + kindTag(f.kind) + esc((f.stem || '').slice(0, 24)) + '</b>'
+    + '<button class="btn" data-action="unfav" data-key="' + esc(f.key) + '" type="button">取消</button></div>'
+    + '<div class="fav-line">' + esc(f.text) + '</div></div>').join('');
+  const correct = state.fav.correct.map((f) => '<div class="fav-card"><div class="fav-head"><b>' + esc((f.stem || '').slice(0, 24)) + '</b>'
+    + '<button class="btn" data-action="unfav-correct" data-key="' + esc(f.key) + '" type="button">移出</button></div>'
+    + '<div class="fav-line">' + esc(f.text) + '</div></div>').join('');
+  view.innerHTML = '<div class="lib-tabs">' + tab('lines', '要点收藏', state.fav.lines.length) + tab('correct', '答对列表', state.fav.correct.length) + '</div>'
+    + '<div class="quiz-entry"><button class="btn primary" data-action="start-quiz" type="button">开始填空练习</button>'
+    + '<span class="dim">从收藏的要点里出题：给一句要点，选出它属于哪张卡</span></div>'
+    + (state.favTab === 'lines'
+      ? (lines || '<div class="empty"><strong>还没有收藏</strong>卡片里每条要点左边有 ☆，点一下就能收藏。</div>')
+      : (correct || '<div class="empty"><strong>还没有答对记录</strong>去填空练习答对，就会进到这里。</div>'));
+}
+
+function renderQuiz() {
+  const q = state.quiz;
+  if (!q || q.error === 'short') {
+    view.innerHTML = '<div class="empty"><strong>收藏的要点还不够出题</strong>至少收藏 2 条要点再来。'
+      + '<br><button class="btn primary" data-action="go-fav" type="button" style="margin-top:10px">去收藏</button></div>';
+    return;
+  }
+  const opts = q.options.map((o, i) => {
+    let cls = 'qopt';
+    if (q.done) {
+      if (o === q.right) cls += ' right';
+      else if (o === q.picked) cls += ' wrong';
+    }
+    return '<button class="' + cls + '" data-action="pick" data-o="' + i + '" type="button"'
+      + (q.done ? ' disabled' : '') + '>' + String.fromCharCode(65 + i) + '　' + esc(o) + '</button>';
+  }).join('');
+  view.innerHTML = '<div class="quiz-head">这句要点说的是哪一项？</div>'
+    + '<div class="quiz-sentence">' + esc(q.item.text) + '</div>'
+    + '<div class="quiz-opts">' + opts + '</div>'
+    + (q.done
+      ? '<div class="quiz-result">' + (q.picked === q.right ? '✅ 答对了 · 已加入答对列表' : '❌ 正确答案：' + esc(q.right))
+        + '</div><div class="quiz-actions"><button class="btn primary" data-action="next-quiz" type="button">下一题</button>'
+        + '<button class="btn" data-action="go-review" type="button">回去背卡</button></div>'
+      : '')
+    + (q.done ? '<div class="quiz-answer">核心答案：' + esc((q.item.answer || '').slice(0, 120)) + '</div>' : '');
+}
+
+async function pickOption(i) {
+  const q = state.quiz;
+  if (!q || q.done) return;
+  const picked = q.options[i];
+  q.picked = picked; q.done = true;
+  if (picked === q.right) {
+    const key = q.item.key;
+    if (!state.fav.correct.some((f) => f.key === key)) {
+      state.fav.correct.unshift({ ...q.item });
+    }
+    state.fav.lines = state.fav.lines.filter((f) => f.key !== key);
+    await db.setMeta('fav', state.fav);
+    celebrate();
+  }
+  renderQuiz();
+}
+
+function cardTerm(card) {
+  return card.term || String(card.stem || '').replace(/[？?].*$/, '').trim().slice(0, 14) || '这张卡';
+}
+
+function drillPool() {
+  return Array.from(state.cards.values()).filter((c) => c.bucket !== 'mastered');
+}
+
+function buildOrder() {
+  // 只出「步骤有真实先后」的卡（显式标了 orderSteps 的），避免把辨析要点当流程排
+  const pool = drillPool().filter((c) => Array.isArray(c.orderSteps) && c.orderSteps.length >= 3);
+  if (!pool.length) { state.drill.order = { error: 'short' }; return; }
+  const card = pool[Math.floor(Math.random() * pool.length)];
+  const right = card.orderSteps.map((x) => String(x).trim());
+  const items = right.slice().sort(() => Math.random() - 0.5);
+  state.drill.order = { cardId: card.id, term: cardTerm(card), stem: card.stem || '', items, right, picked: [], done: false, ok: false };
+}
+
+
+function tfTricks(line, pool, card, term) {
+  const tricks = [];
+  const swap = (from, to, note) => {
+    if (line.includes(from)) tricks.push({ text: line.split(from).join(to), note });
+  };
+  swap('不一定', '一定', '把「不一定」说成了「一定」');
+  swap('没有', '有', '把「没有」说成了「有」');
+  swap('不能', '能', '把「不能」说成了「能」');
+  swap('不是', '是', '把「不是」说成了「是」');
+  swap('无关', '有关', '把「无关」说成了「有关」');
+  swap('必须', '不必', '把「必须」说成了「不必」');
+  swap('需要', '不需要', '把「需要」说成了「不需要」');
+  swap('含有', '不含', '把「含有」说成了「不含」');
+  swap('都能', '都不能', '把「都能」说成了「都不能」');
+  swap('都可以', '都不可以', '把「都可以」说成了「都不可以」');
+  swap('升高', '降低', '把「升高」说成了「降低」');
+  swap('降低', '升高', '把「降低」说成了「升高」');
+  swap('促进', '抑制', '把「促进」说成了「抑制」');
+  swap('抑制', '促进', '把「抑制」说成了「促进」');
+  swap('兴奋', '抑制', '把「兴奋」说成了「抑制」');
+  swap('大于', '小于', '把「大于」说成了「小于」');
+  swap('小于', '大于', '把「小于」说成了「大于」');
+  swap('高于', '低于', '把「高于」说成了「低于」');
+  swap('增加', '减少', '把「增加」说成了「减少」');
+  swap('减少', '增加', '把「减少」说成了「增加」');
+  swap('全部', '部分', '把「全部」说成了「部分」');
+  swap('等于', '大于', '把「等于」说成了「大于」');
+  swap('反比', '正比', '把「反比」说成了「正比」');
+  swap('正比', '反比', '把「正比」说成了「反比」');
+  swap('无核膜', '有核膜', '把「无核膜」说成了「有核膜」');
+  swap('越暗', '越亮', '把「越暗」说成了「越亮」');
+  swap('越亮', '越暗', '把「越亮」说成了「越暗」');
+  swap('越大', '越小', '把「越大」说成了「越小」');
+  swap('越小', '越大', '把「越小」说成了「越大」');
+  swap('越少', '越多', '把「越少」说成了「越多」');
+  swap('越多', '越少', '把「越多」说成了「越少」');
+  // 只是把一个整体名词换成另一个（如「原核」↔「真核」），换成后仍是通顺句子
+  const pairs = [['原核', '真核'], ['真核', '原核'], ['光能自养', '化能自养'], ['异养', '自养'], ['自养', '异养']];
+  for (const [a, b] of pairs) swap(a, b, '把「' + a + '」说成了「' + b + '」');
+  const m = line.match(/[0-9]+/);
+  if (m) {
+    const n2 = String(Number(m[0]) + 1);
+    tricks.push({ text: line.replace(m[0], n2), note: '数字从 ' + m[0] + ' 改成了 ' + n2 });
+  }
+  return tricks;
+}
+
+function buildTF() {
+  const pool = drillPool();
+  if (pool.length < 2) { state.drill.tf = { error: 'short' }; return; }
+  const card = pool[Math.floor(Math.random() * pool.length)];
+  const term = cardTerm(card);
+  const all = basicsLines(card);
+  if (!all.length) { state.drill.tf = { error: 'short' }; return; }
+  const scored = all.map((l) => ({ line: l, tricks: tfTricks(l, pool, card, term) }));
+  const withTricks = scored.filter((x) => x.tricks.length);
+  // 有时优先挑「能被改坏」的那句，这样错句比例高、题目更像真题
+  const preferFalse = withTricks.length > 0 && Math.random() < 0.75;
+  const base = preferFalse
+    ? withTricks[Math.floor(Math.random() * withTricks.length)]
+    : scored[Math.floor(Math.random() * scored.length)];
+  const useFalse = base.tricks.length > 0 && Math.random() < 0.8;
+  const picked = useFalse ? base.tricks[Math.floor(Math.random() * base.tricks.length)] : null;
+  state.drill.tf = {
+    cardId: card.id, term, statement: picked ? picked.text : base.line, truth: base.line,
+    isTrue: !picked, wrongTerm: '', note: picked ? picked.note : '',
+    done: false, ok: false, picked: null,
+  };
+}
+
+
+function startDrill(mode) {
+  state.drill.mode = mode;
+  if (mode === 'order') buildOrder(); else buildTF();
+  state.route = 'drill';
+  render();
+}
+
+function renderDrill() {
+  const mode = state.drill.mode || 'order';
+  const tab = (k, label) => '<button class="lib-tab' + (mode === k ? ' on' : '') + '" data-action="drill-mode" data-m="' + k + '" type="button">' + label + '</button>';
+  const head = '<div class="lib-tabs">' + tab('order', '排序题') + tab('tf', '判断对错') + '</div>';
+  const body = mode === 'order' ? renderOrderBody() : renderTFBody();
+  view.innerHTML = head + body;
+}
+
+function renderOrderBody() {
+  const o = state.drill.order;
+  if (!o || o.error) {
+    return '<div class="empty"><strong>能出排序题的卡还不够</strong>需要至少一张有三个以上步骤的卡。</div>';
+  }
+  const list = o.items.map((t) => {
+    const at = o.picked.indexOf(t);
+    return '<button class="order-item' + (at >= 0 ? ' picked' : '') + '" data-action="order-pick" data-t="' + esc(t) + '" type="button"'
+      + (o.done ? ' disabled' : '') + '>' + (at >= 0 ? '<b>' + (at + 1) + '</b>' : '<b class="dim-num">·</b>')
+      + '<span>' + esc(t) + '</span></button>';
+  }).join('');
+  const right = o.done
+    ? '<div class="order-right"><h3>正确顺序</h3>' + o.right.map((t, i) => '<div class="order-line"><b>' + (i + 1) + '</b><span>' + esc(t) + '</span></div>').join('') + '</div>'
+    : '';
+  return '<div class="quiz-head">按正确顺序点击步骤 · ' + esc(o.term) + '</div>'
+    + '<div class="order-list">' + list + '</div>'
+    + (o.done
+      ? '<div class="quiz-result">' + (o.ok ? '✅ 顺序全对' : '❌ 顺序不对，看下面的正确顺序') + '</div>' + right
+      : '<div class="quiz-actions"><button class="btn primary" data-action="order-check" type="button"'
+        + (o.picked.length === o.items.length ? '' : ' disabled') + '>检查顺序</button>'
+        + '<button class="btn" data-action="order-reset" type="button">重新点</button></div>')
+    + '<div class="quiz-actions"><button class="btn" data-action="drill-next" type="button">下一题</button></div>';
+}
+
+function renderTFBody() {
+  const t = state.drill.tf;
+  if (!t || t.error) return '<div class="empty"><strong>题量还不够</strong>至少要有两张卡。</div>';
+  const back = t.done
+    ? '<div class="tf-explain"><div class="quiz-result">' + (t.ok ? '✅ 判断正确' : '❌ 判断错了') + '</div>'
+      + '<div class="tf-truth">这句说的是<b>' + esc(t.term) + '</b>。正确表述：' + esc(t.truth) + '</div>'
+      + (t.isTrue ? '' : '<div class="tf-truth dim">错在：' + esc(t.note) + '</div>') + '</div>'
+    : '';
+  return '<div class="quiz-head">这句话对不对？</div>'
+    + '<div class="quiz-sentence">' + esc(t.statement) + '</div>'
+    + '<div class="tf-actions">'
+    + '<button class="qopt tf-btn' + (t.done && t.picked === true ? (t.isTrue ? ' right' : ' wrong') : '') + '" data-action="tf-pick" data-v="1" type="button"' + (t.done ? ' disabled' : '') + '>✔ 对</button>'
+    + '<button class="qopt tf-btn' + (t.done && t.picked === false ? (t.isTrue ? ' wrong' : ' right') : '') + '" data-action="tf-pick" data-v="0" type="button"' + (t.done ? ' disabled' : '') + '>✘ 错</button>'
+    + '</div>' + back
+    + '<div class="quiz-actions"><button class="btn primary" data-action="drill-next" type="button">下一题</button></div>';
+}
+
 function renderTagBar() {
   const active = Array.from(state.cards.values()).filter((c) => c.bucket !== 'mastered');
   const counts = new Map();
@@ -422,7 +766,17 @@ function renderReview() {
   const face = (card.image ? '<img class="shot" src="' + card.image + '" alt="题图">' : '')
     + (card.stem ? '<div class="stem">' + esc(formatStem(card.stem)) + '</div>' : (card.image ? '' : '<div class="stem">（无题干）</div>'));
   const problemBlock = '<div class="problem">' + face + '</div>';
+  const doneToday = Array.from(state.cards.values())
+    .filter((c) => c.lastReviewAt && dayKey(new Date(c.lastReviewAt)) === dayKey()).length;
+  const totalToday = doneToday + state.queue.length;
+  const pct = totalToday ? Math.round((doneToday / totalToday) * 100) : 0;
   view.innerHTML = renderTagBar()
+    + '<div class="today-bar"><div class="today-fill" style="width:' + pct + '%"></div></div>'
+    + '<div class="drill-entry"><button class="btn" data-action="start-drill" data-m="order" type="button">排序练习</button>'
+    + '<button class="btn" data-action="start-drill" data-m="tf" type="button">判断对错</button>'
+    + '<button class="btn" data-action="start-quiz" type="button">填空练习</button></div>'
+    + '<div class="today-text">今日进度 ' + doneToday + ' / ' + totalToday
+    + (state.lastUndo ? '　<span class="undo-tip">按 U 撤销上一步</span>' : '') + '</div>'
     // 翻开解法后，题面变成悬浮窗（宽屏浮在左侧、窄屏吸顶），方便边看解析边瞟题
     + (revealed ? '<div class="float-stem"><div class="float-tag">题目</div>' + problemBlock + '</div>' : problemBlock)
     + '<div class="control">'
@@ -440,14 +794,17 @@ function renderReview() {
         + '<div class="speak-row">'
         + '<button class="spk-btn" data-action="speak-all" type="button">🔊 连读：答案 + 要点</button>'
         + '<button class="spk-btn ghost" data-action="stop-speak" id="spk-stop" type="button" hidden>停止</button>'
+        + '<button class="spk-btn auto' + (state.settings.autoSpeak ? ' on' : '') + '" data-action="toggle-auto-speak" type="button">'
+        + (state.settings.autoSpeak ? '🔁 自动播放：开' : '🔁 自动播放：关') + '</button>'
         + '</div>'
-        + (card.basics ? '<div class="basics"><div class="move-label">要点<button class="spk small" data-action="speak-basics" type="button" title="朗读要点">🔊</button></div><div class="basics-body">' + esc(formatStem(card.basics)) + '</div></div>' : '')
+        + (card.basics ? '<div class="basics"><div class="move-label">要点<button class="spk small" data-action="speak-basics" type="button" title="朗读要点">🔊</button></div><div class="basics-body">' + renderBasics(card) + '</div></div>' : '')
         + '<div class="move-label">展开详解（共 ' + steps.length + ' 步 · 卡住哪步点哪步）</div>'
         + '<div class="steps">'
         + steps.map((s, i) => {
             const open = state.expandedSteps.indexOf(i) >= 0;
             return '<div class="step' + (open ? ' is-open' : '') + '">'
               + '<div class="step-head">'
+              + starBtn(card.id, 'step', i, favText(card, 'step', i))
               + '<span class="step-title">' + esc(s.brief) + '</span>'
               + '<button class="step-btn" data-action="toggle-step" data-i="' + i + '" type="button">' + (open ? '收起' : '展开') + '</button>'
               + '</div>'
@@ -497,14 +854,21 @@ function renderReview() {
               ? '<div class="tip-ans"><b>答案</b>' + esc(formatStem(cardTipAnswers(card)[i])) + '</div>'
               : '')
             + '</div>').join('')
-        + '<div class="hint-line">先在脑子里说出「第一步做什么」，再点提示或看解法</div>')
+        + '<div class="hint-line">先在脑子里说出「第一步做什么」，再点提示或看解法</div>'
+        + '<div class="speak-row"><button class="spk-btn auto' + (state.settings.autoSpeak ? ' on' : '') + '" data-action="toggle-auto-speak" type="button">'
+        + (state.settings.autoSpeak ? '🔁 自动播放：开（翻开答案就朗读）' : '🔁 自动播放：关（翻开答案不朗读）') + '</button></div>')
     + '</div>'
     + '<div class="grade-bar' + (revealed ? '' : ' is-locked') + '">'
-    + '<button class="grade" data-action="grade" data-g="0" type="button">没头绪</button>'
-    + '<button class="grade" data-action="grade" data-g="1" type="button">想到方向</button>'
-    + '<button class="grade" data-action="grade" data-g="2" type="button">秒出第一步</button>'
+    + '<button class="grade" data-action="grade" data-g="0" type="button">没头绪<em>1</em></button>'
+    + '<button class="grade" data-action="grade" data-g="1" type="button">想到方向<em>2</em></button>'
+    + '<button class="grade" data-action="grade" data-g="2" type="button">秒出第一步<em>3</em></button>'
+    + '<button class="grade bury" data-action="bury" type="button">今天<br>不再出现<em>B</em></button>'
     + '</div>'
-    + '<div class="row-actions"><button class="link-btn" data-action="master" type="button">这条已经会了 · 移出</button></div>';
+    + '<div class="row-actions">'
+    + (state.lastUndo ? '<button class="link-btn undo" data-action="undo" type="button">↩ 撤销上一步（U）</button>' : '')
+    + '<button class="link-btn" data-action="master" type="button">这条已经会了 · 移出</button>'
+    + '<span class="dim kbd">快捷键：1/2/3 评分 · 空格 看详解 · B 藏起 · U 撤销</span>'
+    + '</div>';
 }
 
 function renderLibrary() {
@@ -514,12 +878,17 @@ function renderLibrary() {
   const nMastered = all.filter((c) => c.bucket === 'mastered').length;
   const f = state.libFilter || 'all';
   const list = all
-    .filter((c) => f === 'all' || (f === 'mastered' ? c.bucket === 'mastered' : c.bucket !== 'mastered'))
+    .filter((c) => {
+      if (f === 'all') return true;
+      if (f === 'mastered') return c.bucket === 'mastered';
+      if (f === 'hard') return c.bucket !== 'mastered' && (c.lapses || 0) >= 3;
+      return c.bucket !== 'mastered';
+    })
     .filter((c) => !q || (c.move || '').includes(q) || (c.stem || '').includes(q) || (c.tags || []).join(' ').includes(q))
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   const rows = list.map((c) => '<div class="row">'
     + (c.image ? '<img class="thumb" src="' + c.image + '" alt="">' : '<div class="thumb thumb-text">文</div>')
-    + '<div class="row-main"><div class="row-word">' + esc((c.move || c.stem || '').slice(0, 28)) + (c.bucket === 'mastered' ? ' <span class="tag">已会</span>' : '') + '</div>'
+    + '<div class="row-main"><div class="row-word">' + esc((c.move || c.stem || '').slice(0, 28)) + (c.bucket === 'mastered' ? ' <span class="tag">已会</span>' : ((c.lapses || 0) >= 3 ? ' <span class="tag hard">难词 ×' + (c.lapses || 0) + '</span>' : '')) + '</div>'
     + '<div class="row-sub">' + esc((c.tags || []).join(' · ') || '未分类') + '</div></div>'
     + (c.bucket === 'mastered'
       ? '<button class="btn" data-action="restore" data-id="' + esc(c.id) + '" type="button">恢复</button>'
@@ -530,7 +899,9 @@ function renderLibrary() {
   view.innerHTML = (state.editor !== null && state.editor !== undefined ? renderEditor() : '')
     + '<div class="list-head"><input class="search" id="search" value="' + esc(state.search) + '" placeholder="搜术语或详解">'
     + '<button class="btn primary" data-action="new-card" type="button">+ 拍题</button></div>'
-    + '<div class="lib-tabs">' + tab('all', '全部', all.length) + tab('active', '在练', nActive) + tab('mastered', '已会', nMastered) + '</div>'
+    + '<div class="lib-tabs">' + tab('all', '全部', all.length) + tab('active', '在练', nActive)
+      + tab('hard', '难词', all.filter((c) => c.bucket !== 'mastered' && (c.lapses || 0) >= 3).length)
+      + tab('mastered', '已会', nMastered) + '</div>'
     + (list.length ? rows
       : (f === 'mastered'
         ? '<div class="empty"><strong>还没有移出的题</strong>在做题页点「这条已经会了 · 移出」，就会进到这里，随时可以恢复。</div>'
@@ -575,6 +946,30 @@ function renderEditor() {
     + '</div></div>';
 }
 
+function statsSection() {
+  const cards = Array.from(state.cards.values());
+  const today = dayKey();
+  const doneToday = cards.filter((c) => c.lastReviewAt && dayKey(new Date(c.lastReviewAt)) === today);
+  const byGrade = [0, 1, 2].map((g) => doneToday.filter((c) => c.lastGrade === g).length);
+  const labels = ['没头绪', '想到方向', '秒出第一步'];
+  const rows = byGrade.map((n, i) => '<div class="stat-row"><span>' + labels[i] + '</span>'
+    + '<div class="stat-bar"><i style="width:' + (doneToday.length ? Math.round((n / doneToday.length) * 100) : 0) + '%"></i></div>'
+    + '<b>' + n + '</b></div>').join('');
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(); d.setDate(d.getDate() + i);
+    const key = dayKey(d);
+    const n = cards.filter((c) => c.bucket !== 'mastered' && c.due && dayKey(new Date(c.due)) === key).length;
+    days.push({ label: i === 0 ? '今天' : (i + '天后'), n });
+  }
+  const maxN = Math.max(1, ...days.map((d) => d.n));
+  const bars = days.map((d) => '<div class="fc"><i style="height:' + Math.round((d.n / maxN) * 100) + '%"></i>'
+    + '<span>' + d.n + '</span><em>' + d.label + '</em></div>').join('');
+  return '<div class="section"><h2>统计</h2>'
+    + '<p class="sub">今天已评 ' + doneToday.length + ' 张</p>' + (rows || '<p class="sub dim">今天还没开始</p>')
+    + '<h3>未来 7 天到期</h3><div class="forecast">' + bars + '</div></div>';
+}
+
 function renderSettings() {
   db.countCards().then((n) => {
     const el = document.getElementById('stats-line');
@@ -587,7 +982,7 @@ function renderSettings() {
       line.style.color = au === n.total && n.total > 0 ? '#2f6b45' : '#b45309';
     }
   }).catch(() => {});
-  view.innerHTML = '<div class="section"><h2>思考倒计时</h2>'
+  view.innerHTML = statsSection() + '<div class="section"><h2>思考倒计时</h2>'
     + '<p class="sub">每题正面先强制想 N 秒才能看答案。这是整套训练的关键——没有这一步，就退化成「看答案」。</p>'
     + '<div class="field"><input id="f-delay" type="number" min="0" max="60" value="' + esc(state.settings.delaySec) + '"></div>'
     + '<div class="actions"><button class="btn primary" data-action="save-delay" type="button">保存</button></div></div>'
@@ -610,7 +1005,7 @@ function renderSettings() {
     + '<p class="sub">合并导入只加新题、同 id 的跳过——以后分批加题用它，不会冲掉你手机上已有的题。</p>'
     + '<p class="sub" id="audio-line">语音包：检测中…</p>'
     + '<p class="sub" id="stats-line">统计中…</p>'
-    + '<p class="sub dim">代码版本 v3-audio（如果你看不到这一行，说明页面还是旧代码，按 Ctrl+Shift+R 强制刷新）</p>'
+    + '<p class="sub dim">代码版本 v6-drill（如果你看不到这一行，说明页面还是旧代码，按 Ctrl+Shift+R 强制刷新）</p>'
     + '<div class="actions"><button class="btn danger" data-action="reset" type="button">重置全部数据</button></div></div>';
 }
 
@@ -619,6 +1014,9 @@ function render() {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('is-active', t.dataset.route === state.route));
   if (!view) return;
   if (state.route === 'review') renderReview();
+  else if (state.route === 'quiz') renderQuiz();
+  else if (state.route === 'drill') renderDrill();
+  else if (state.route === 'fav') renderFav();
   else if (state.route === 'library') renderLibrary();
   else renderSettings();
 }
@@ -869,6 +1267,57 @@ if (view) {
       return;
     }
     if (action === 'grade') { await gradeCard(Number(el.dataset.g)); return; }
+    if (action === 'undo') { await undoLast(); return; }
+    if (action === 'fav-line') { await toggleFavLine(el.dataset.id, el.dataset.i, el.dataset.kind); return; }
+    if (action === 'fav-tab') { state.favTab = el.dataset.f; render(); return; }
+    if (action === 'unfav') {
+      state.fav.lines = state.fav.lines.filter((f) => f.key !== el.dataset.key);
+      await db.setMeta('fav', state.fav); render(); return;
+    }
+    if (action === 'unfav-correct') {
+      state.fav.correct = state.fav.correct.filter((f) => f.key !== el.dataset.key);
+      await db.setMeta('fav', state.fav); render(); return;
+    }
+    if (action === 'start-quiz') { buildQuiz(); state.route = 'quiz'; render(); return; }
+    if (action === 'start-drill') { startDrill(el.dataset.m || 'order'); return; }
+    if (action === 'drill-mode') { startDrill(el.dataset.m || 'order'); return; }
+    if (action === 'drill-next') { startDrill(state.drill.mode); return; }
+    if (action === 'order-pick') {
+      const o = state.drill.order;
+      if (!o || o.done) return;
+      const t = el.dataset.t;
+      const at = o.picked.indexOf(t);
+      if (at >= 0) o.picked.splice(at, 1); else o.picked.push(t);
+      render();
+      return;
+    }
+    if (action === 'order-reset') { state.drill.order.picked = []; render(); return; }
+    if (action === 'order-check') {
+      const o = state.drill.order;
+      if (!o || o.picked.length !== o.items.length) return;
+      o.ok = o.picked.every((t, i) => t === o.right[i]);
+      o.done = true;
+      state.drill.score.total++;
+      if (o.ok) { state.drill.score.ok++; celebrate(); }
+      render();
+      return;
+    }
+    if (action === 'tf-pick') {
+      const t = state.drill.tf;
+      if (!t || t.done) return;
+      t.picked = el.dataset.v === '1';
+      t.ok = t.picked === t.isTrue;
+      t.done = true;
+      state.drill.score.total++;
+      if (t.ok) { state.drill.score.ok++; celebrate(); }
+      render();
+      return;
+    }
+    if (action === 'next-quiz') { buildQuiz(); render(); return; }
+    if (action === 'pick') { await pickOption(Number(el.dataset.o)); return; }
+    if (action === 'go-fav') { state.route = 'fav'; render(); return; }
+    if (action === 'go-review') { state.route = 'review'; resetCardState(); render(); return; }
+    if (action === 'bury') { await buryCurrent(); return; }
     if (action === 'master') { const c = currentCard(); if (c) await masterCard(c.id); return; }
     if (action === 'restore') { await restoreCard(el.dataset.id); return; }
     if (action === 'set-tag') {
@@ -985,3 +1434,52 @@ if (view) {
   }
   try { if (navigator.serviceWorker) navigator.serviceWorker.register('./sw.js').catch(() => {}); } catch (err) { /* 忽略 */ }
 })();
+
+document.addEventListener('keydown', (e) => {
+  if (!state.ready || state.route !== 'review' || state.editor !== null) return;
+  if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === 'u') { e.preventDefault(); undoLast(); return; }
+  if (k === 'b') { e.preventDefault(); buryCurrent(); return; }
+  if (k === ' ' || k === 'p') {
+    e.preventDefault();
+    if (!state.revealed) { const btn = document.getElementById('reveal-btn'); if (btn) btn.click(); }
+    return;
+  }
+  if (k === '1' || k === '2' || k === '3') { e.preventDefault(); gradeCard(Number(k) - 1); }
+});
+
+const CELEBRATIONS = [
+  { emoji: '🎉', text: '答对了！', cls: 'pop', color: '#15803d' },
+  { emoji: '✨', text: '漂亮！', cls: 'swing', color: '#0ea5e9' },
+  { emoji: '👏', text: '一字不差', cls: 'slideUp', color: '#f59e0b' },
+  { emoji: '🔥', text: '稳！', cls: 'bounce', color: '#ef4444' },
+  { emoji: '🎯', text: '正中靶心', cls: 'zoomIn', color: '#8b5cf6' },
+  { emoji: '📖', text: '记住了', cls: 'flip', color: '#0891b2' },
+  { emoji: '⭐', text: '这题满分', cls: 'spin', color: '#eab308' },
+  { emoji: '🏮', text: '生物通了', cls: 'wobble', color: '#dc2626' },
+  { emoji: '🍃', text: '轻舟已过', cls: 'drift', color: '#16a34a' },
+  { emoji: '💯', text: '漂亮，继续', cls: 'burst', color: '#f97316' },
+];
+
+function celebrate() {
+  const c = CELEBRATIONS[Math.floor(Math.random() * CELEBRATIONS.length)];
+  const layer = document.createElement('div');
+  layer.className = 'celebrate-layer';
+  const pieces = [];
+  for (let i = 0; i < 22; i++) {
+    const left = Math.round(Math.random() * 100);
+    const delay = (Math.random() * 0.35).toFixed(2);
+    const dur = (1.1 + Math.random() * 0.6).toFixed(2);
+    const size = 6 + Math.round(Math.random() * 8);
+    const round = Math.random() > 0.5 ? '50%' : '2px';
+    pieces.push('<i style="left:' + left + '%;width:' + size + 'px;height:' + (size * (Math.random() > 0.5 ? 1 : 2)) +
+      'px;border-radius:' + round + ';background:' + c.color + ';animation-delay:' + delay + 's;animation-duration:' + dur + 's"></i>');
+  }
+  layer.innerHTML = '<div class="confetti">' + pieces.join('') + '</div>'
+    + '<div class="celebrate-card ' + c.cls + '"><div class="celebrate-emoji">' + c.emoji + '</div>'
+    + '<div class="celebrate-text">' + c.text + '</div></div>';
+  document.body.appendChild(layer);
+  setTimeout(() => layer.remove(), 1700);
+}
