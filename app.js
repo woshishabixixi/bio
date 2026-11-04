@@ -298,7 +298,6 @@ function bumpStreak() {
 async function gradeCard(g) {
   const card = currentCard();
   if (!card) return;
-  if (!state.revealed) { toast('先看详解，再评分'); return; }
   const wasNew = card.state === 'new';
   // 撤销快照：评分前把卡片与计数状态整份存下来，按 U 可以整份还原
   state.lastUndo = {
@@ -453,8 +452,17 @@ function stepLines(card) {
   return cardSteps(card).map((s) => String(s.detail || '').replace(/^\s*[①-⑳]\s*/, '').trim()).filter(Boolean);
 }
 
+function askLines(card) {
+  return cardAsks(card).map((it) => String(it.q || '').trim()).filter(Boolean);
+}
+
+function askAnswerAt(card, idx) {
+  const as = cardAsks(card);
+  return (as[Number(idx)] || {}).a || '';
+}
+
 function favText(card, kind, idx) {
-  const lines = kind === 'step' ? stepLines(card) : basicsLines(card);
+  const lines = kind === 'step' ? stepLines(card) : kind === 'ask' ? askLines(card) : basicsLines(card);
   return lines[Number(idx)] || '';
 }
 
@@ -476,7 +484,7 @@ function renderBasics(card) {
 async function toggleFavLine(cardId, idx, kind) {
   const card = state.cards.get(cardId);
   if (!card) return;
-  const kindName = kind === 'step' ? 'step' : 'basic';
+  const kindName = kind === 'step' ? 'step' : kind === 'ask' ? 'ask' : 'basic';
   const text = favText(card, kindName, idx);
   if (!text) return;
   const key = favKey(cardId, text);
@@ -485,7 +493,7 @@ async function toggleFavLine(cardId, idx, kind) {
     state.fav.lines.splice(at, 1);
     toast('已取消收藏');
   } else {
-    state.fav.lines.unshift({ key, cardId, text, kind: kindName, answer: card.answer || '', stem: card.stem || '' });
+    state.fav.lines.unshift({ key, cardId, text, kind: kindName, answer: card.answer || '', stem: card.stem || '', ans: kindName === 'ask' ? askAnswerAt(card, idx) : '' });
     toast('已收藏 · 可去「收藏 → 填空」练');
   }
   await db.setMeta('fav', state.fav);
@@ -528,27 +536,29 @@ function buildQuiz() {
 
 function renderFav() {
   const tab = (k, label, n) => '<button class="lib-tab' + (state.favTab === k ? ' on' : '') + '" data-action="fav-tab" data-f="' + k + '" type="button">' + label + ' ' + n + '</button>';
-  const kindTag = (k) => '<span class="tag">' + (k === 'step' ? '详解' : '要点') + '</span>';
+  const kindTag = (k) => '<span class="tag">' + (k === 'step' ? '详解' : k === 'ask' ? '自测' : '要点') + '</span>';
   const lines = state.fav.lines.map((f) => '<div class="fav-card"><div class="fav-head"><b>' + kindTag(f.kind) + esc((f.stem || '').slice(0, 24)) + '</b>'
     + '<button class="btn" data-action="unfav" data-key="' + esc(f.key) + '" type="button">取消</button></div>'
-    + '<div class="fav-line">' + esc(f.text) + '</div></div>').join('');
+    + '<div class="fav-line">' + esc(f.text) + '</div>'
+    + (f.ans ? '<div class="fav-line dim">答：' + esc(f.ans) + '</div>' : '')
+    + '</div>').join('');
   const correct = state.fav.correct.map((f) => '<div class="fav-card"><div class="fav-head"><b>' + esc((f.stem || '').slice(0, 24)) + '</b>'
     + '<button class="btn" data-action="unfav-correct" data-key="' + esc(f.key) + '" type="button">移出</button></div>'
     + '<div class="fav-line">' + esc(f.text) + '</div></div>').join('');
   view.innerHTML = '<div class="lib-tabs">' + tab('lines', '要点收藏', state.fav.lines.length) + tab('correct', '答对列表', state.fav.correct.length) + '</div>'
     + '<div class="quiz-entry"><button class="btn primary" data-action="start-quiz" type="button">开始填空练习</button>'
-    + '<span class="dim">从收藏的要点里出题：给一句要点，选出它属于哪张卡</span>'
+    + '<span class="dim">从收藏里出题：给一句要点或自测问句，选出它属于哪张卡</span>'
     + '<div class="drill-entry"><button class="btn" data-action="start-drill" data-m="order" type="button">排序练习</button>'
     + '<button class="btn" data-action="start-drill" data-m="tf" type="button">判断对错</button></div></div>'
     + (state.favTab === 'lines'
-      ? (lines || '<div class="empty"><strong>还没有收藏</strong>卡片里每条要点左边有 ☆，点一下就能收藏。</div>')
+      ? (lines || '<div class="empty"><strong>还没有收藏</strong>卡片里每条要点、详解步骤、自测问句左边都有 ☆，点一下就能收藏。</div>')
       : (correct || '<div class="empty"><strong>还没有答对记录</strong>去填空练习答对，就会进到这里。</div>'));
 }
 
 function renderQuiz() {
   const q = state.quiz;
   if (!q || q.error === 'short') {
-    view.innerHTML = '<div class="empty"><strong>收藏的要点还不够出题</strong>至少收藏 2 条要点再来。'
+    view.innerHTML = '<div class="empty"><strong>收藏还不够出题</strong>至少收藏 2 条再来。'
       + '<br><button class="btn primary" data-action="go-fav" type="button" style="margin-top:10px">去收藏</button></div>';
     return;
   }
@@ -844,7 +854,7 @@ function renderReview() {
             + cardAsks(card).map((it, i) => {
                 const open = state.askOpen.indexOf(i) >= 0;
                 return '<div class="ask-item">'
-                  + '<div class="ask-q"><span>' + esc(it.q) + '</span>'
+                  + '<div class="ask-q">' + starBtn(card.id, 'ask', i, it.q) + '<span>' + esc(it.q) + '</span>'
                   + (it.a ? '<button class="step-btn" data-action="toggle-ask" data-i="' + i + '" type="button">' + (open ? '收起' : '看答案') + '</button>' : '<span class="ask-na">暂无</span>')
                   + '</div>'
                   + (open ? '<div class="ask-a">' + esc(it.a) + '</div>' : '')
@@ -880,7 +890,7 @@ function renderReview() {
         + '<div class="speak-row"><button class="spk-btn auto' + (state.settings.autoSpeak ? ' on' : '') + '" data-action="toggle-auto-speak" type="button">'
         + (state.settings.autoSpeak ? '🔁 自动播放：开（翻开答案就朗读）' : '🔁 自动播放：关（翻开答案不朗读）') + '</button></div>')
     + '</div>'
-    + '<div class="grade-bar' + (revealed ? '' : ' is-locked') + '">'
+    + '<div class="grade-bar">'
     + '<button class="grade" data-action="grade" data-g="0" type="button">没头绪<em>1</em></button>'
     + '<button class="grade" data-action="grade" data-g="1" type="button">想到方向<em>2</em></button>'
     + '<button class="grade" data-action="grade" data-g="2" type="button">秒出第一步<em>3</em></button>'
@@ -1034,7 +1044,7 @@ function renderSettings() {
     + '<p class="sub">合并导入只加新题、同 id 的跳过——以后分批加题用它，不会冲掉你手机上已有的题。</p>'
     + '<p class="sub" id="audio-line">语音包：检测中…</p>'
     + '<p class="sub" id="stats-line">统计中…</p>'
-    + '<p class="sub dim">代码版本 v8-jump-streak（如果你看不到这一行，说明页面还是旧代码，按 Ctrl+Shift+R 强制刷新）</p>'
+    + '<p class="sub dim">代码版本 v10-grade-front（如果你看不到这一行，说明页面还是旧代码，按 Ctrl+Shift+R 强制刷新）</p>'
     + '<div class="actions"><button class="btn danger" data-action="reset" type="button">重置全部数据</button></div></div>';
 }
 
