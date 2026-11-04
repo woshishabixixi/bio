@@ -34,6 +34,7 @@ const state = {
   quiz: null,
   anim: 0,
   drill: { mode: 'order', order: null, tf: null, score: { ok: 0, total: 0 } },
+  drillTag: '',
   run: { cur: 0, best: 0, total: 0, m3: 0, m5: 0, m10: 0 },
   sound: 'on',
 };
@@ -668,8 +669,9 @@ function tfTricks(line, pool, card, term) {
 }
 
 function buildTF() {
-  const pool = drillPool();
-  if (pool.length < 2) { state.drill.tf = { error: 'short' }; return; }
+  const tag = state.drillTag || '';
+  const pool = drillPool().filter((c) => !tag || ((c.tags || [])[0] || '未分类') === tag);
+  if (!pool.length) { state.drill.tf = { error: 'short' }; return; }
   const card = pool[Math.floor(Math.random() * pool.length)];
   const term = cardTerm(card);
   const all = basicsLines(card);
@@ -703,7 +705,7 @@ function renderDrill() {
   const tab = (k, label) => '<button class="lib-tab' + (mode === k ? ' on' : '') + '" data-action="drill-mode" data-m="' + k + '" type="button">' + label + '</button>';
   const head = '<div class="lib-tabs">' + tab('order', '排序题') + tab('tf', '判断对错') + '</div>';
   const body = mode === 'order' ? renderOrderBody() : renderTFBody();
-  view.innerHTML = head + body;
+  view.innerHTML = head + (mode === 'tf' ? renderDrillTagBar() : '') + body;
 }
 
 function renderOrderBody() {
@@ -736,7 +738,7 @@ function renderOrderBody() {
 
 function renderTFBody() {
   const t = state.drill.tf;
-  if (!t || t.error) return '<div class="empty"><strong>题量还不够</strong>至少要有两张卡。</div>';
+  if (!t || t.error) return '<div class="empty"><strong>题量还不够</strong>这个章节还没有可练习的卡。</div>';
   const back = t.done
     ? '<div class="tf-explain"><div class="quiz-result">' + (t.ok ? '✅ 判断正确' : '❌ 判断错了') + '</div>'
       + '<div class="tf-truth">这句说的是<b>' + esc(t.term) + '</b>。正确表述：' + esc(t.truth) + '</div>'
@@ -771,6 +773,23 @@ function renderTagBar() {
     '<button class="tag-chip' + (cur === key ? ' on' : '') + '" data-action="set-tag" data-tag="' + esc(key) + '" type="button">'
     + esc(label) + '<span class="tag-n">' + n + '</span></button>';
   let html = '<div class="tag-bar">' + chip('', '全部', active.length);
+  for (const [k, n] of counts) html += chip(k, k, n);
+  html += '</div>';
+  return html;
+}
+
+function renderDrillTagBar() {
+  const active = Array.from(state.cards.values()).filter((c) => c.bucket !== 'mastered');
+  const counts = new Map();
+  for (const c of active) {
+    const k = (c.tags || [])[0] || '未分类';
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  const cur = state.drillTag || '';
+  const chip = (key, label, n) =>
+    '<button class="tag-chip' + (cur === key ? ' on' : '') + '" data-action="set-drill-tag" data-tag="' + esc(key) + '" type="button">'
+    + esc(label) + '<span class="tag-n">' + n + '</span></button>';
+  let html = '<div class="tag-bar drill-tags">' + chip('', '全部章节', active.length);
   for (const [k, n] of counts) html += chip(k, k, n);
   html += '</div>';
   return html;
@@ -1044,7 +1063,7 @@ function renderSettings() {
     + '<p class="sub">合并导入只加新题、同 id 的跳过——以后分批加题用它，不会冲掉你手机上已有的题。</p>'
     + '<p class="sub" id="audio-line">语音包：检测中…</p>'
     + '<p class="sub" id="stats-line">统计中…</p>'
-    + '<p class="sub dim">代码版本 v10-grade-front（如果你看不到这一行，说明页面还是旧代码，按 Ctrl+Shift+R 强制刷新）</p>'
+    + '<p class="sub dim">代码版本 v11-tf-chapter（如果你看不到这一行，说明页面还是旧代码，按 Ctrl+Shift+R 强制刷新）</p>'
     + '<div class="actions"><button class="btn danger" data-action="reset" type="button">重置全部数据</button></div></div>';
 }
 
@@ -1320,6 +1339,7 @@ if (view) {
     if (action === 'start-quiz') { buildQuiz(); state.route = 'quiz'; render(); return; }
     if (action === 'start-drill') { startDrill(el.dataset.m || 'order'); return; }
     if (action === 'drill-mode') { startDrill(el.dataset.m || 'order'); return; }
+    if (action === 'set-drill-tag') { state.drillTag = el.dataset.tag || ''; buildTF(); render(); return; }
     if (action === 'drill-next') { startDrill(state.drill.mode); return; }
     if (action === 'goto-card') { state.quiz = null; state.drill.order = null; state.drill.tf = null; gotoCard(el.dataset.id); return; }
     if (action === 'toggle-sound') {
